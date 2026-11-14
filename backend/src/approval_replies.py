@@ -1,4 +1,4 @@
-"""Strict, auditable parsing for email and Telegram approval replies."""
+"""Strict, auditable parsing for email approval replies."""
 from __future__ import annotations
 
 import re
@@ -15,12 +15,6 @@ QUOTED_REPLY = re.compile(
     r"^\s*(?:>{1,}|-{2,}\s*original message|on .+wrote:|from:\s)",
     re.IGNORECASE,
 )
-TELEGRAM_COMMAND = re.compile(
-    r"^\s*/?(approve|approved|reject|rejected)\s+(APR-[A-Z0-9-]+)(?:\s+(.+?))?\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 @dataclass(frozen=True)
 class ApprovalReply:
     approval_id: str
@@ -89,15 +83,3 @@ def parse_email_reply(subject: str, body: str) -> ApprovalReply | None:
     if cleaned is None:
         return None
     return ApprovalReply(ids.pop(), decision, cleaned)
-
-
-def parse_telegram_reply(text: str) -> ApprovalReply | None:
-    match = TELEGRAM_COMMAND.match(text)
-    if not match:
-        return None
-    action, approval_id, raw_comments = match.groups()
-    decision = "APPROVED" if action.lower().startswith("approve") else "REJECTED"
-    comments = _clean_comments(raw_comments or "")
-    if comments is None:
-        return None
-    return ApprovalReply(approval_id.upper(), decision, comments)

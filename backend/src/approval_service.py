@@ -28,7 +28,7 @@ def _as_utc(value: datetime) -> datetime:
 
 def _expire(conn, approval, decision_time: str) -> None:
     message = (
-        "The approval window expired without a valid email or Telegram response. "
+        "The approval window expired without a valid email response. "
         "No action was taken; please contact support if you still need help."
     )
     updated = conn.execute(
@@ -122,8 +122,8 @@ def apply_channel_decision(
                 ),
             )
             reply = (
-                "Your request was reviewed and the simulated action has been initiated. "
-                f"Reference: {reference}."
+                "Your request was reviewed and approved. The simulated action has been "
+                f"initiated. Reference: {reference}."
             )
             ticket_status = "Resolved"
         else:
@@ -132,6 +132,8 @@ def apply_channel_decision(
                 "continue investigating and update this case."
             )
             ticket_status = "Escalated"
+        if comments.strip():
+            reply += f"\nApprover comment: {comments.strip()}"
 
         conn.execute(
             "UPDATE support_tickets SET status=?,resolution=?,updated_at=? WHERE id=?",

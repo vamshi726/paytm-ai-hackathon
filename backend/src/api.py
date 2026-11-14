@@ -7,7 +7,6 @@ from .rag import vector_store
 from .schemas import ChatRequest
 from .email_service import send_approval_email
 from .openai_responses import OpenAIResponseAgent
-from .telegram_service import send_approval_telegram
 from .workflow import build_support_workflow
 router=APIRouter(prefix="/api")
 triage_agent,investigation_agent,resolution_agent=TriageAgent(),InvestigationAgent(vector_store),ResolutionAgent()
@@ -32,11 +31,9 @@ def chat(request:ChatRequest):
         conn.execute("INSERT INTO chat_messages VALUES(?,?,?,?,?)",(str(uuid.uuid4()),case_id,"assistant",outcome["reply"],utc_now()))
     if approval:
         email_delivered,email_detail=send_approval_email(case_id,approval["id"],approval["action"],outcome["risk"],approval["expires_at"])
-        telegram_delivered,telegram_detail=send_approval_telegram(case_id,approval["id"],approval["action"],outcome["risk"],approval["expires_at"])
         with database.connection() as conn:
             database.log_activity(conn,case_id,"EMAIL_NOTIFICATION",email_detail)
-            database.log_activity(conn,case_id,"TELEGRAM_NOTIFICATION",telegram_detail)
-        approval.update({"notification_sent":email_delivered or telegram_delivered,"email_notification_sent":email_delivered,"telegram_notification_sent":telegram_delivered})
+        approval.update({"notification_sent":email_delivered,"email_notification_sent":email_delivered})
     return {"case_id":case_id,"message":outcome["reply"],"status":outcome["status"],"risk_level":outcome["risk"],"approval":approval,"transaction":tx,"rag_sources":[x["source"] for x in evidence["playbooks"]]}
 @router.get("/chat/history/{case_id}")
 def history(case_id:str):

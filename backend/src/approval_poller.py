@@ -1,4 +1,4 @@
-"""Background polling for authorized email and Telegram approval replies."""
+"""Background polling for authorized email approval replies."""
 from __future__ import annotations
 
 import imaplib
@@ -8,15 +8,10 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
-from .approval_replies import APPROVAL_ID, parse_email_reply, parse_telegram_reply
+from .approval_replies import APPROVAL_ID, parse_email_reply
 from .approval_service import apply_channel_decision, expire_pending_approvals
 from .database import database
 from .email_service import EmailSettings, ImapSettings, fetch_approval_emails
-from .telegram_service import (
-    TelegramPollingError,
-    TelegramSettings,
-    get_telegram_updates,
-)
 
 logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = 10
@@ -32,8 +27,6 @@ class ApprovalReplyPoller:
                 self.poll_once()
             except imaplib.IMAP4.error as error:
                 logger.error("Email reply polling failed (%s)", type(error).__name__)
-            except TelegramPollingError as error:
-                logger.error("Telegram reply polling failed (%s)", str(error))
             except (sqlite3.Error, OSError, ValueError) as error:
                 logger.error("Approval reply polling failed (%s)", type(error).__name__)
             self.stop_event.wait(POLL_INTERVAL_SECONDS)
@@ -44,20 +37,13 @@ class ApprovalReplyPoller:
                 "SELECT 1 FROM approval_requests WHERE status='PENDING' LIMIT 1"
             ).fetchone()
         if has_pending:
-            pollers = []
             if os.getenv("HITL_EMAIL", "").strip().lower() in {"1", "true", "yes", "on"}:
-                pollers.append(("Email", self._poll_email))
-            if os.getenv("HITL_TELEGRAM", "").strip().lower() in {"1", "true", "yes", "on"}:
-                pollers.append(("Telegram", self._poll_telegram))
-            for channel, poll in pollers:
                 try:
-                    poll()
+                    self._poll_email()
                 except imaplib.IMAP4.error as error:
-                    logger.error("%s reply polling failed (%s)", channel, type(error).__name__)
-                except TelegramPollingError as error:
-                    logger.error("%s reply polling failed (%s)", channel, str(error))
+                    logger.error("Email reply polling failed (%s)", type(error).__name__)
                 except (sqlite3.Error, OSError, ValueError) as error:
-                    logger.error("%s reply polling failed (%s)", channel, type(error).__name__)
+                    logger.error("Email reply polling failed (%s)", type(error).__name__)
         expire_pending_approvals()
 
     def _poll_email(self) -> None:
@@ -114,67 +100,10 @@ class ApprovalReplyPoller:
                 )
         self._set_state("email_uid", str(next_uid))
 
-    def _poll_telegram(self) -> None:
-        settings = TelegramSettings.from_environment()
-        if settings is None:
-            logger.error("Telegram reply polling enabled but bot settings are incomplete")
-            return
-
-        offset = int(self._get_state("telegram_offset", "0"))
-        updates, next_offset = get_telegram_updates(offset)
-        for update in updates:
-            message = update.get("message")
-            if not isinstance(message, dict) or not self._authorized_private_chat(
-                message, settings.chat_id
-            ):
-                continue
-            text = message.get("text")
-            reply = parse_telegram_reply(text) if isinstance(text, str) else None
-            if reply is None:
-                self._log_ignored_telegram(message, "missing approval ID, decision, or comments")
-                continue
-            sender_id = message["from"]["id"]
-            result = apply_channel_decision(
-                reply.approval_id,
-                reply.decision,
-                reply.comments,
-                f"telegram:{sender_id}",
-                now=self._telegram_received_at(message),
-            )
-            if result is None:
-                self._log_ignored_telegram(message, "approval is not pending")
-        self._set_state("telegram_offset", str(next_offset))
-
-    @staticmethod
-    def _authorized_private_chat(message: dict, configured_chat_id: str) -> bool:
-        chat = message.get("chat")
-        sender = message.get("from")
-        return (
-            isinstance(chat, dict)
-            and isinstance(sender, dict)
-            and chat.get("type") == "private"
-            and str(chat.get("id")) == str(configured_chat_id)
-            and str(sender.get("id")) == str(configured_chat_id)
-        )
-
-    @staticmethod
-    def _telegram_received_at(message: dict) -> datetime:
-        timestamp = message.get("date")
-        if isinstance(timestamp, int) and not isinstance(timestamp, bool):
-            return datetime.fromtimestamp(timestamp, timezone.utc)
-        return datetime.now(timezone.utc)
-
     def _log_ignored_email(self, subject: str, body: str, reason: str) -> None:
         self._log_ignored_reply(
             APPROVAL_ID.findall(f"{subject}\n{body}"),
             "email",
-            reason,
-        )
-
-    def _log_ignored_telegram(self, message: dict, reason: str) -> None:
-        self._log_ignored_reply(
-            APPROVAL_ID.findall(str(message.get("text", ""))),
-            "telegram",
             reason,
         )
 

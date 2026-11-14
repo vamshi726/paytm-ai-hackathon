@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -32,6 +33,13 @@ class MarkdownVectorStore:
         )
         self.documents = self._load_markdown()
         self.collection = None
+        if os.getenv("SAATHI_DISABLE_CHROMA", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
         try:
             import chromadb
 

@@ -1,7 +1,6 @@
 import os
 os.environ["HITL_EMAIL"] = "false"  # Never send real messages during unit tests.
-os.environ["HITL_TELEGRAM"] = "false"  # Never send real messages during unit tests.
-import json
+os.environ["SAATHI_DISABLE_CHROMA"] = "true"
 import sqlite3
 import tempfile
 import threading
@@ -20,10 +19,9 @@ from backend.src.main import app
 from backend.src.email_service import EmailSettings
 from backend.src import api as api_module
 from backend.src import openai_responses
-from backend.src import telegram_service
 from backend.src import email_service
 from backend.src import approval_poller as approval_poller_module
-from backend.src.approval_replies import parse_email_reply, parse_telegram_reply
+from backend.src.approval_replies import parse_email_reply
 from backend.src.approval_service import apply_channel_decision, expire_pending_approvals
 from backend.src.approval_poller import ApprovalReplyPoller
 from backend.src.email_service import ImapSettings, IncomingEmail
@@ -65,6 +63,7 @@ def test_duplicate_charge_waits_for_channel_reply_not_dashboard_decision():
     )
     assert decided is not None
     assert decided["status"] == "Resolved"
+    assert "Approver comment: Duplicate debit verified by reviewer" in decided["message"]
     assert apply_channel_decision(
         approval_id,
         "APPROVED",
@@ -146,55 +145,11 @@ def test_email_request_contains_reply_template_and_html(monkeypatch):
     assert "Decision: APPROVED" in message.get_body(preferencelist=("plain",)).get_content()
     assert message.get_body(preferencelist=("html",)).get_content_subtype() == "html"
 
-def test_telegram_notification_posts_approval_to_configured_chat(monkeypatch):
-    monkeypatch.setenv("HITL_TELEGRAM", "true")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test-chat")
-    captured = {}
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def read(self):
-            return b'{"ok":true}'
-
-    def fake_urlopen(request, timeout):
-        captured["request"] = request
-        captured["timeout"] = timeout
-        return FakeResponse()
-
-    monkeypatch.setattr(telegram_service, "urlopen", fake_urlopen)
-    sent, detail = telegram_service.send_approval_telegram(
-        "CASE-TEST",
-        "APR-TEST",
-        "Simulated refund",
-        "HIGH",
-        "2026-01-01T00:20:00+00:00",
-    )
-
-    assert sent is True
-    assert "sent" in detail
-    assert captured["timeout"] == 10
-    assert captured["request"].get_method() == "POST"
-    payload = json.loads(captured["request"].data)
-    assert payload["chat_id"] == "test-chat"
-    assert "APR-TEST" in payload["text"]
-    assert "No action is taken" in payload["text"]
-
-def test_approval_response_reports_email_and_telegram_delivery(monkeypatch):
+def test_approval_response_reports_email_delivery(monkeypatch):
     monkeypatch.setattr(
         api_module,
         "send_approval_email",
         lambda *args: (True, "Email accepted"),
-    )
-    monkeypatch.setattr(
-        api_module,
-        "send_approval_telegram",
-        lambda *args: (False, "Telegram rejected the notification"),
     )
 
     response = client.post(
@@ -206,7 +161,6 @@ def test_approval_response_reports_email_and_telegram_delivery(monkeypatch):
     approval = response.json()["approval"]
     assert approval["notification_sent"] is True
     assert approval["email_notification_sent"] is True
-    assert approval["telegram_notification_sent"] is False
 
 def test_email_approval_reply_requires_id_decision_and_comments():
     reply = parse_email_reply(
@@ -236,16 +190,6 @@ def test_email_approval_reply_requires_id_decision_and_comments():
         "Decision: APPROVED\nComments: Verified.",
     ) is None
 
-def test_telegram_reply_requires_approval_id_and_comments():
-    reply = parse_telegram_reply("APPROVED APR-AB12CD34 Verified duplicate charge")
-    assert reply is not None
-    assert reply.approval_id == "APR-AB12CD34"
-    assert reply.decision == "APPROVED"
-    assert reply.comments == "Verified duplicate charge"
-    no_comment_reply = parse_telegram_reply("REJECTED APR-AB12CD34")
-    assert no_comment_reply is not None
-    assert no_comment_reply.comments == ""
-
 def test_authorized_email_reply_is_processed_by_poller(monkeypatch):
     monkeypatch.setenv("HITL_EMAIL", "true")
     monkeypatch.setenv("HITL_APPROVER_EMAIL", "approver@example.test")
@@ -255,7 +199,6 @@ def test_authorized_email_reply_is_processed_by_poller(monkeypatch):
     monkeypatch.setenv("SMTP_PASSWORD", "test-password")
     monkeypatch.setenv("IMAP_HOST", "imap.example.test")
     monkeypatch.setattr(api_module, "send_approval_email", lambda *args: (True, "sent"))
-    monkeypatch.setattr(api_module, "send_approval_telegram", lambda *args: (False, "disabled"))
     created = client.post(
         "/api/chat/message",
         json={"message": "I was charged twice ₹5,000"},
@@ -279,53 +222,16 @@ def test_authorized_email_reply_is_processed_by_poller(monkeypatch):
     ApprovalReplyPoller(threading.Event())._poll_email()
 
     with sqlite3.connect(database.path) as conn:
-        status = conn.execute(
-            "SELECT status FROM approval_requests WHERE id=?",
+        approval = conn.execute(
+            "SELECT status,reviewer_comments FROM approval_requests WHERE id=?",
             (approval_id,),
-        ).fetchone()[0]
-    assert status == "APPROVED"
-
-def test_authorized_private_telegram_reply_is_processed_by_poller(monkeypatch):
-    monkeypatch.setenv("HITL_TELEGRAM", "true")
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
-    monkeypatch.setattr(api_module, "send_approval_email", lambda *args: (False, "disabled"))
-    monkeypatch.setattr(api_module, "send_approval_telegram", lambda *args: (True, "sent"))
-    created = client.post(
-        "/api/chat/message",
-        json={"message": "I was charged twice ₹5,000"},
-    ).json()
-    approval_id = created["approval"]["id"]
-    monkeypatch.setattr(
-        "backend.src.approval_poller.get_telegram_updates",
-        lambda offset: (
-            [
-                {
-                    "update_id": 25,
-                    "message": {
-                        "chat": {"id": 12345, "type": "private"},
-                        "from": {"id": 12345},
-                        "text": f"REJECTED {approval_id} Duplicate was not confirmed",
-                    },
-                }
-            ],
-            26,
-        ),
-    )
-
-    ApprovalReplyPoller(threading.Event())._poll_telegram()
-
-    with sqlite3.connect(database.path) as conn:
-        status = conn.execute(
-            "SELECT status FROM approval_requests WHERE id=?",
-            (approval_id,),
-        ).fetchone()[0]
-    assert status == "REJECTED"
+        ).fetchone()
+    assert approval[0] == "APPROVED"
+    assert approval[1] == "Duplicate payment verified."
 
 
 def test_email_received_before_deadline_is_accepted_when_polled_late(monkeypatch):
     monkeypatch.setenv("HITL_EMAIL", "true")
-    monkeypatch.setenv("HITL_TELEGRAM", "false")
     monkeypatch.setenv("HITL_APPROVER_EMAIL", "approver@example.test")
     monkeypatch.setenv("SMTP_HOST", "smtp.example.test")
     monkeypatch.setenv("SMTP_FROM", "saathi@example.test")
@@ -333,7 +239,6 @@ def test_email_received_before_deadline_is_accepted_when_polled_late(monkeypatch
     monkeypatch.setenv("SMTP_PASSWORD", "test-password")
     monkeypatch.setenv("IMAP_HOST", "imap.example.test")
     monkeypatch.setattr(api_module, "send_approval_email", lambda *args: (True, "sent"))
-    monkeypatch.setattr(api_module, "send_approval_telegram", lambda *args: (False, "disabled"))
     created = client.post(
         "/api/chat/message",
         json={"message": "I was charged twice ₹5,000"},
@@ -387,7 +292,6 @@ def test_approval_is_committed_before_notification_delivery(monkeypatch):
         return True, "sent"
 
     monkeypatch.setattr(api_module, "send_approval_email", reply_during_send)
-    monkeypatch.setattr(api_module, "send_approval_telegram", lambda *args: (False, "disabled"))
 
     response = client.post(
         "/api/chat/message",
@@ -428,7 +332,7 @@ def test_unanswered_approval_expires_without_executing():
         approval_id,
         "APPROVED",
         "Late approval after timeout",
-        "telegram:123",
+        "email:approver@example.test",
     ) is None
 
 def test_openai_response_agent_uses_configured_model_and_grounded_draft(monkeypatch):
@@ -478,7 +382,6 @@ def test_openai_response_agent_requires_api_key(monkeypatch):
 
 def test_api_lifespan_starts_approval_poller_without_network_when_disabled(monkeypatch):
     monkeypatch.setenv("HITL_EMAIL", "false")
-    monkeypatch.setenv("HITL_TELEGRAM", "false")
 
     with TestClient(app) as running_client:
         response = running_client.get("/api/health")

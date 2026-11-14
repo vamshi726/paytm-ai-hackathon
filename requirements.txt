@@ -1,0 +1,12 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pytest>=8.0.0
+python-dotenv>=1.0.0
+openai>=1.66.0
+langchain-core>=1.2.0,<2.0.0
+langchain-text-splitters>=1.1.0,<2.0.0
+langchain-openai>=1.1.0,<2.0.0
+langgraph>=1.0.0,<2.0.0
+# Optional open-source persistent vector database. The built-in local cosine
+# vector index keeps the Markdown-only RAG workflow runnable offline.
+chromadb>=0.5.0
